@@ -1,0 +1,107 @@
+#!/bin/bash
+# sqp [REMOTE/BRANCH]
+# squashpush2review:
+# this is a gerrit helper that makes it so
+# you dont need to squash or commit amend all the time.
+#
+# Just commit, amend, merge, cherry-pick, rebase etc. like ordinary,
+# and then to push to gerrit with `sqp`
+#
+# If you need to change something in your gerrit changeset,
+# just commit as usual and then run `sqp` again.
+#
+# If you want to diff against or checkout your last gerrit changeset,
+# use `sqp/<branch>`, like `git diff mybranch sqp/mybranch`
+#
+# If you rather run it as `git sqp`, add:
+#       sqp = "!f(){ sqp $@; };f"
+# to you git config
+#
+# This uses the branch name to map to gerrit changes, so if you reuse branch names
+# for different changes this will behave weird (while still work).
+#
+# internally, step by step, this script:
+# - breaks loose from the branch (so to not change it)
+# - autosquashes to the branch off point,
+#   in relation to the target branch (origin/master)
+# - commits the squashed files,
+#   starting commit message from all squashed commit messages
+#    OR
+#   the commit message used the previous time this branch was sqp'd
+# - marks this commit with refs/sqp/<branch>, so to keep the commit message
+# - pushes the refs/sqp/<branch> to the remote/target
+# - makes sure to always exit on the original branch
+# ...
+# │
+# o $BRANCH_BASE (origin/master or branch off point)
+# ├┬┐
+# ││o $TARGET (origin/master, sometimes identical with $BRANCH_BASE)
+# │o refs/sqp/$BRANCH (what is pushed, contentwise identical with $BRANCH)
+# ... (commits)
+# │
+# o $BRANCH
+set -ue -o pipefail
+TRACKED_TARGET=$(git rev-parse --abbrev-ref '@{u}' 2> /dev/null || true)
+# Either use $1, else the tracking branch, else origin/master
+TARGET=${1:-${TRACKED_TARGET:-origin/master}}
+BRANCH=$(git branch --show-current)
+# get the hash of the common ancestor of BRANCH and TARGET
+BRANCH_BASE=$(git merge-base "${BRANCH}" "${TARGET}" 2> /dev/null || true)
+# get REMOTE and BRANCH from TARGET,
+# since both remote and branch can contain multiple slashes, look in remotes
+# for anything starting with the first token before slash.
+# Should uniquely match one, if none the remote does not exist,
+# if more than one the repo is probably corrupt anyway.
+TARGET_REMOTE=$(git remote | grep --max-count 1 "^${TARGET%%/*}" || true)
+# the rest of value (sans one extra slash) is the remote branch
+TARGET_BRANCH=${TARGET:${#TARGET_REMOTE}+1}
+if [[ $(git remote | grep --count "^${TARGET%%/*}") -ne 1 ]]; then
+  echo "Error: No unique remote starting with \"${TARGET%%/*}\" among:"
+  git remote
+  exit 1
+fi
+
+if ! (git diff-index --quiet HEAD); then
+  echo "Error: You have changed tracked files:"
+  git diff-index --name-only HEAD
+  exit 1
+fi
+
+if [[ -z "${BRANCH}" ]]; then
+  echo "Error: You are not on a branch"
+  exit 1
+fi
+
+if [[ -z "${BRANCH_BASE}" ]]; then
+  echo "Error: ${BRANCH} is not based on any parent of ${TARGET}"
+  exit 1
+fi
+
+if (git diff --quiet --exit-code "${BRANCH}" "${BRANCH_BASE}"); then
+  echo "Error: \"${BRANCH}\" and (common ancestor of) \"${TARGET}\" are identical"
+  exit 1
+fi
+
+if [[ "${BRANCH_BASE}" != "$(git rev-parse --verify "${TARGET}")" ]]; then
+  echo "Warning: You have not rebased ontop of ${TARGET}"
+  echo "Will squash to the common ancestor ${BRANCH_BASE}"
+fi
+
+get_commit_message() {
+  git show --format=%B --no-patch "$1" 2> /dev/null
+}
+# either use the last push or use all the commits as base commit message
+base_commit_message() {
+  get_commit_message "refs/sqp/${BRANCH}" \
+  || get_commit_message "${BRANCH_BASE}..${BRANCH}"
+}
+
+TMP_DIR=$(mktemp -d)
+trap 'git worktree remove --force "${TMP_DIR}"' EXIT
+# break loose to temporary worktree
+git worktree add --detach --quiet "${TMP_DIR}" "${BRANCH}"
+# squash in temporary worktree
+git -C "${TMP_DIR}" reset --soft --quiet "${BRANCH_BASE}"
+git -C "${TMP_DIR}" commit --verbose --edit --message "$(base_commit_message)"
+git -C "${TMP_DIR}" update-ref "refs/sqp/${BRANCH}" HEAD
+git push "${TARGET_REMOTE}" "refs/sqp/${BRANCH}:refs/for/${TARGET_BRANCH}"
